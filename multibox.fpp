@@ -8,18 +8,20 @@ module multibox
   public :: init_multibox
   public :: finish_multibox
   public :: multibox_communicate
+  public :: apply_radial_boundary_conditions
   public :: init_mb_get_phi
   public :: mb_get_phi
   public :: communicate_multibox_parameters
   public :: add_multibox_krook
-  public :: boundary_size
   public :: bs_fullgrid
   public :: xL, xR
   public :: rhoL, rhoR
   public :: kx0_L, kx0_R
   public :: RK_step, comm_at_init
   public :: include_multibox_krook
+  public :: time_multibox
   public :: phi_buffer0, phi_buffer1
+  public :: use_dirichlet_BC
 
 
   private
@@ -31,6 +33,8 @@ module multibox
   real,    dimension (:), allocatable :: krook_fac
   real,    dimension (:), allocatable :: b_mat
   real, dimension(:), allocatable :: x_mb, rho_mb, rho_mb_clamped
+
+  real, dimension (2,2) :: time_multibox = 0.
 
   real :: dx_mb
 
@@ -47,11 +51,13 @@ module multibox
 
   logical :: mb_transforms_initialized = .false.
   logical :: get_phi_initialized = .false.
+  logical :: use_multibox
   integer :: temp_ind = 0
   integer :: bs_fullgrid
   integer :: mb_debug_step 
   integer :: x_fft_size
   integer :: phi_bound, phi_pow
+  integer :: ikymin
   
 
   real :: xL = 0., xR = 0.
@@ -59,19 +65,20 @@ module multibox
   real :: kx0_L, kx0_R
   !real :: efac_l, efacp_l
 
-  integer :: boundary_size, krook_size
-  real :: nu_krook_mb, krook_exponent
-  logical :: smooth_ZFs
+  real :: nu_krook_mb, krook_exponent, krook_efold
+  logical :: smooth_ZFs, use_dirichlet_BC
   logical :: RK_step, include_multibox_krook, comm_at_init
   integer :: krook_option_switch
-  integer, parameter:: krook_option_default = 0, &
-                       krook_option_linear  = 0, &
-                       krook_option_exp   = 1, &
-                       krook_option_exp_rev  = 2 
+  integer, parameter:: krook_option_default = 1, &
+                       krook_option_flat    = 0, &
+                       krook_option_linear  = 1, &
+                       krook_option_exp     = 2, &
+                       krook_option_exp_rev = 3
   integer:: mb_zf_option_switch
-  integer, parameter :: mb_zf_option_default = 0, &
-                        mb_zf_option_no_ky0  = 1, &
-                        mb_zf_option_no_fsa  = 2
+  integer, parameter :: mb_zf_option_default   = 0, &
+                        mb_zf_option_skip_ky0  = 1, &
+                        mb_zf_option_zero_ky0  = 2, &
+                        mb_zf_option_zero_fsa  = 3
   integer :: LR_debug_switch
   integer, parameter:: LR_debug_option_default  = 0, &
                        LR_debug_option_L        = 1, &
@@ -85,7 +92,7 @@ contains
     use file_utils, only: runtype_option_switch, runtype_multibox
     use text_options, only: text_option, get_option_value
     use mp, only: broadcast, proc0
-    use kt_grids, only: nx, nakx
+    use kt_grids, only: nx, nakx, boundary_size, copy_size, krook_size
     use job_manage, only: njobs
     use mp, only: scope, crossdomprocs, subprocs, &
                   send, receive, job
@@ -97,15 +104,17 @@ contains
     logical exist
     
 
-    type (text_option), dimension (4), parameter :: krook_opts = &
+    type (text_option), dimension (5), parameter :: krook_opts = &
       (/ text_option('default', krook_option_default), &
+         text_option('flat',  krook_option_flat) , &
          text_option('linear',  krook_option_linear) , &
          text_option('exp',         krook_option_exp) , &
          text_option('exp_reverse', krook_option_exp_rev)/)
-    type (text_option), dimension (3), parameter :: mb_zf_opts = &
-      (/ text_option('default', mb_zf_option_default), &
-         text_option('no_ky0',  mb_zf_option_no_ky0) , &
-         text_option('no_fsa',  mb_zf_option_no_fsa)/)
+    type (text_option), dimension (4), parameter :: mb_zf_opts = &
+      (/ text_option('default',  mb_zf_option_default),  &
+         text_option('skip_ky0', mb_zf_option_skip_ky0), &
+         text_option('zero_ky0', mb_zf_option_zero_ky0), &
+         text_option('zero_fsa', mb_zf_option_zero_fsa)/)
     type (text_option), dimension (3), parameter :: LR_db_opts = &
       (/ text_option('default', LR_debug_option_default), &
          text_option('L',       LR_debug_option_L) , &
@@ -116,15 +125,19 @@ contains
                                    smooth_ZFs, zf_option, LR_debug_option, &
                                    krook_option, RK_step, nu_krook_mb, &
                                    mb_debug_step, krook_exponent, comm_at_init, &
-                                   phi_bound, phi_pow
+                                   phi_bound, phi_pow, krook_efold, use_dirichlet_BC
 
-    if(runtype_option_switch /= runtype_multibox) return
+!   if(runtype_option_switch /= runtype_multibox) then
+!     boundary_size = 0; krook_size = 0; copy_size = 0
+!     return
+!   endif
 
     boundary_size = 4
     krook_size = 0
     phi_bound = 0
     phi_pow = 0
     krook_exponent = 0.0
+    krook_efold = 3.0
     nu_krook_mb = 0.0
     mb_debug_step = 1000
     smooth_ZFs = .false.
@@ -133,6 +146,7 @@ contains
     zf_option = 'default'
     krook_option = 'default'
     LR_debug_option = 'default'
+    use_dirichlet_BC = .false.
     
     if (proc0) then
       in_file = input_unit_exist("multibox_parameters", exist)
@@ -159,38 +173,53 @@ contains
     call broadcast(mb_zf_option_switch)
     call broadcast(krook_option_switch)
     call broadcast(krook_exponent)
+    call broadcast(krook_efold)
     call broadcast(LR_debug_switch)
     call broadcast(RK_step)
     call broadcast(mb_debug_step)
     call broadcast(comm_at_init)
     call broadcast(phi_bound)
     call broadcast(phi_pow)
+    call broadcast(use_dirichlet_BC)
 
-    call scope(crossdomprocs)
+    if(runtype_option_switch.eq.runtype_multibox) then
+      call scope(crossdomprocs)
 
-    if(job==1) then
-      call receive(nakxl,0)
-      call receive(nxl  ,0)
-      call receive(nakxr,njobs-1)
-      call receive(nxr  ,njobs-1)
+      if(job==1) then
+        call receive(nakxl,0)
+        call receive(nxl  ,0)
+        call receive(nakxr,njobs-1)
+        call receive(nxr  ,njobs-1)
 
-      ! the following assumes nx in the center domain is some
-      ! integer multiple of nx in the left or right domain.
-      ! Also assumes dx is the same in every domain, which should
-      ! be the case
-      fac=nx/nxl
-      x_fft_size=nakxl*fac
+        ! the following assumes nx in the center domain is some
+        ! integer multiple of nx in the left or right domain.
+        ! Also assumes dx is the same in every domain, which should
+        ! be the case
+        fac=nx/nxl
+        x_fft_size=nakxl*fac
+      else
+        call send(nakx,1)
+        call send(nx,1)
+        x_fft_size = nakx
+      endif
+
+      call scope(subprocs)
     else
-      call send(nakx,1)
-      call send(nx,1)
       x_fft_size = nakx
     endif
 
-    call scope(subprocs)
 
-    if(abs(nu_krook_mb) > epsilon(0.0)) then
+    if((runtype_option_switch.eq.runtype_multibox).or.use_dirichlet_bc) then 
+      use_multibox = .true.
+    else
+      use_multibox = .false.
+    endif
+
+    if(abs(nu_krook_mb) > epsilon(0.0).and.use_multibox) then
       include_multibox_krook = .true.
     endif
+
+    copy_size = boundary_size - krook_size
 
   end subroutine read_multibox_parameters
 
@@ -201,8 +230,9 @@ contains
     use stella_geometry, only: drhodpsi, dxdXcoord
     use zgrid, only: nzgrid, ntubes
     use kt_grids, only: nakx,naky, akx, aky, nx,x, x_d, x0
-    use kt_grids, only: centered_in_rho, rho_clamped, rho_d_clamped
+    use kt_grids, only: centered_in_rho, rho_clamped, rho_d, rho_d_clamped
     use kt_grids, only: periodic_variation
+    use kt_grids, only: boundary_size, krook_size
     use file_utils, only: runtype_option_switch, runtype_multibox
     use job_manage, only: njobs
     use physics_parameters, only: rhostar
@@ -220,10 +250,12 @@ contains
 
     real :: db, x_shift, dqdrho
 
-
-    if(runtype_option_switch /= runtype_multibox) return
+    if (.not.use_multibox) return
 
     bs_fullgrid = nint((3.0*boundary_size)/2.0)
+
+    ikymin = 1
+    if (mb_zf_option_switch.eq.mb_zf_option_skip_ky0) ikymin = 2
 
     pfac = 1
     if (periodic_variation) pfac = 2
@@ -234,7 +266,7 @@ contains
     if (.not.allocated(g_buffer1)) allocate(g_buffer1(g_buff_size))
     if (.not.allocated(phi_buffer0)) allocate(phi_buffer0(phi_buff_size))
     if (.not.allocated(phi_buffer1)) allocate(phi_buffer1(phi_buff_size))
-    if (.not.allocated(fsa_x) .and. (mb_zf_option_switch.eq.mb_zf_option_no_fsa)) then
+    if (.not.allocated(fsa_x) .and. (mb_zf_option_switch.eq.mb_zf_option_zero_fsa)) then
       allocate(fsa_x(nakx)); fsa_x=0.0
     endif
     if (.not.allocated(copy_mask_left))   allocate(copy_mask_left(pfac*boundary_size));  copy_mask_left =1.0
@@ -242,8 +274,18 @@ contains
     if (.not.allocated(krook_mask_left))  allocate(krook_mask_left(pfac*boundary_size));  krook_mask_left =0.0
     if (.not.allocated(krook_mask_right)) allocate(krook_mask_right(pfac*boundary_size)); krook_mask_right=0.0
 
+    g_buffer0 = 0.
+    g_buffer1 = 0.
+    phi_buffer0 = 0.
+    phi_buffer1 = 0.
+
     if (krook_size .gt. 0) then
       select case (krook_option_switch)
+      case (krook_option_flat)
+        do i = 1, krook_size
+          krook_mask_right(i) = 1.0
+          copy_mask_right(i) = 0.0
+        enddo
       case (krook_option_linear)
         db = 1.0/krook_size
         do i = 1, krook_size
@@ -251,15 +293,15 @@ contains
           copy_mask_right(i) = 0.0
         enddo
       case (krook_option_exp)
-        db = 3.0/krook_size
+        db = krook_efold/krook_size
         do i = 1, krook_size
-          krook_mask_right(i) = 1.0-(1.0-exp(-(krook_size-i)*db))/(1.0-exp(-3.0))
+          krook_mask_right(i) = 1.0-(1.0-exp(-(krook_size-i)*db))/(1.0-exp(-krook_efold))
           copy_mask_right(i) = 0.0
         enddo
       case (krook_option_exp_rev)
-        db = 3.0/krook_size
+        db = krook_efold/krook_size
         do i = 1, krook_size
-          krook_mask_right(i) = (1.0-exp(-i*db))/(1.0-exp(-3.0))
+          krook_mask_right(i) = (1.0-exp(-i*db))/(1.0-exp(-krook_efold))
           copy_mask_right(i) = 0.0
         enddo
       end select
@@ -286,12 +328,21 @@ contains
       krook_fac(i) = (aky(i)/aky(2))**krook_exponent
     enddo
 
-#ifdef MPI
-    call scope(crossdomprocs)
+    call init_mb_transforms
 
     if(.not.allocated(x_mb)) allocate(x_mb(x_fft_size))
     if(.not.allocated(rho_mb)) allocate(rho_mb(x_fft_size))
     if(.not.allocated(rho_mb_clamped)) allocate(rho_mb_clamped(x_fft_size))
+    
+    if(runtype_option_switch /= runtype_multibox) then
+      x_mb = x_d
+      rho_mb = rho_d
+      rho_mb_clamped = rho_d_clamped
+      return
+    endif
+#ifdef MPI
+    call scope(crossdomprocs)
+
     dx_mb = (2*pi*x0)/x_fft_size
 
     if(job==1) then
@@ -379,7 +430,6 @@ contains
     call scope(subprocs)
 #endif
 
-    call init_mb_transforms
 
   end subroutine init_multibox
 
@@ -438,11 +488,11 @@ contains
 
     use constants, only: zi
     use kt_grids, only: nakx,naky,naky_all, akx, aky, nx,ny,dx,dy, zonal_mode
-    use kt_grids, only: periodic_variation
+    use kt_grids, only: periodic_variation, boundary_size
     use file_utils, only: runtype_option_switch, runtype_multibox
     use file_utils, only: get_unused_unit
     use fields_arrays, only: phi, phi_corr_QN, shift_state
-    use job_manage, only: njobs
+    use job_manage, only: njobs, time_message
     use physics_flags, only: radial_variation,prp_shear_enabled, hammett_flow_shear
     use physics_parameters, only: g_exb, g_exbfac
     use stella_layouts, only: vmu_lo
@@ -450,15 +500,14 @@ contains
     use zgrid, only: nzgrid
     use mp, only: job, scope, mp_abort,  &
                   crossdomprocs, subprocs, allprocs, &
-                  send, receive, proc0
+                  ssend, receive, proc0
 
     implicit none
 
-    integer :: num,ia, ix,iix,iL,iR, iky,iz,it,iv
-    integer :: offset, offsetL, offsetR
+    integer :: num,ia, ix,iix,iky,iz,it,iv
+    integer :: offset
     integer :: ii,jj, temp_unit, pfac
     real :: afacx, afacy
-    complex :: dzm,dzp
     character(len=512) :: filename
 
     complex, dimension (:,:), allocatable :: prefac
@@ -470,6 +519,9 @@ contains
     if(runtype_option_switch /= runtype_multibox) return
     if(LR_debug_switch /= LR_debug_option_default) return
     if(njobs /= 3) call mp_abort("Multibox only supports 3 domains at the moment.")
+
+
+    if (proc0) call time_message(.false.,time_multibox(:,1), ' mb_comm')
 
     allocate (prefac(naky,x_fft_size)); prefac = 1.0
     
@@ -512,7 +564,6 @@ contains
     call scope(crossdomprocs)
 
     ia=1
-
     if(job==0 .or. job==(njobs-1)) then
       if (periodic_variation) then
         offset=-boundary_size
@@ -528,7 +579,7 @@ contains
         do it = 1, vmu_lo%ntubes
 
           !this is where the FSA goes
-          if(zonal_mode(1) .and. mb_zf_option_switch .eq. mb_zf_option_no_fsa) then
+          if(zonal_mode(1) .and. mb_zf_option_switch .eq. mb_zf_option_zero_fsa) then
             do ix= 1,nakx
               fsa_x(ix) = sum(dl_over_b(ia,:)*gin(1,ix,:,it,iv))
             enddo
@@ -538,35 +589,34 @@ contains
             fft_kxky = gin(:,:,iz,it,iv)
 
             if(zonal_mode(1)) then
-              if(    mb_zf_option_switch .eq. mb_zf_option_no_ky0) then
+              if(    mb_zf_option_switch .eq. mb_zf_option_zero_ky0) then
                 fft_kxky(1,:) = 0.0
-              elseif(mb_zf_option_switch .eq. mb_zf_option_no_fsa) then
+              elseif(mb_zf_option_switch .eq. mb_zf_option_zero_fsa) then
                 fft_kxky(1,:) = fft_kxky(1,:) - fsa_x
               endif
             endif
 
             call transform_kx2x(fft_kxky,fft_xky)
             fft_xky = fft_xky*prefac
-            do ix=1,pfac*boundary_size
-              iix=ix + offset
+            do ix = 1, pfac*boundary_size
+              iix = ix + offset
               if(iix.le.0) iix = iix + nakx
-              do iky=1,naky
+              do iky = ikymin, naky
                 !DSO if in the future the grids can have different naky, one will
                 !have to divide by naky here, and multiply on the receiving end
                 g_buffer0(num) = fft_xky(iky,iix)
-                num=num+1
+                num = num + 1
               enddo
             enddo
           enddo
         enddo
       enddo
-      call send(g_buffer0,1,43 + job)
+      call ssend(g_buffer0,1,43 + job)
       !now phi
       num=1
       do it = 1, vmu_lo%ntubes
-
         !this is where the FSA goes
-        if(zonal_mode(1) .and. mb_zf_option_switch .eq. mb_zf_option_no_fsa) then
+        if(zonal_mode(1) .and. mb_zf_option_switch .eq. mb_zf_option_zero_fsa) then
           do ix= 1,nakx
             fsa_x(ix) = sum(dl_over_b(ia,:)*phi(1,ix,:,it))
           enddo
@@ -576,38 +626,31 @@ contains
           fft_kxky = spread((zi*akx)**phi_pow,1,naky)*phi(:,:,iz,it)
 
           if(zonal_mode(1)) then
-            if(    mb_zf_option_switch .eq. mb_zf_option_no_ky0) then
+            if(    mb_zf_option_switch .eq. mb_zf_option_zero_ky0) then
               fft_kxky(1,:) = 0.0
-            elseif(mb_zf_option_switch .eq. mb_zf_option_no_fsa) then
+            elseif(mb_zf_option_switch .eq. mb_zf_option_zero_fsa) then
               fft_kxky(1,:) = fft_kxky(1,:) - fsa_x
             endif
           endif
 
           call transform_kx2x(fft_kxky,fft_xky)
           fft_xky = fft_xky*prefac
-          do iky=1,naky
-            do ix=1,pfac*boundary_size
-              iix=ix + offset
+          do iky = ikymin, naky
+            do ix = 1, pfac*boundary_size
+              iix = ix + offset
               if(iix.le.0) iix = iix + nakx
               !DSO if in the future the grids can have different naky, one will
               !have to divide by naky here, and multiply on the receiving end
               phi_buffer0(num) = fft_xky(iky,iix)
-              num=num+1
+              num = num + 1
             enddo
           enddo
         enddo
       enddo
 ! DSO - send data
-      call send(phi_buffer0,1,143 + job)
+      call ssend(phi_buffer0,1,143 + job)
     else
-      offsetL = 0
-      offsetR = x_fft_size - boundary_size
-      if (periodic_variation) then
-        offsetL = -boundary_size
-        offsetR = x_fft_size/2 - boundary_size + 1
-      endif
 ! DSO - receive the data
-
 ! left
       call receive(g_buffer0,0, 43)
       call receive(phi_buffer0,0, 143)
@@ -615,42 +658,8 @@ contains
       call receive(g_buffer1,njobs-1, 43+njobs-1)
       call receive(phi_buffer1,njobs-1, 143+njobs-1)
 
-      num=1
-      do iv = vmu_lo%llim_proc, vmu_lo%ulim_proc
-        do it = 1, vmu_lo%ntubes
-          do iz = -vmu_lo%nzgrid, vmu_lo%nzgrid
-            call transform_kx2x(gin(:,:,iz,it,iv),fft_xky)  
-            do ix=1,pfac*boundary_size
-              iL = ix + offsetL
-              iR = ix + offsetR
-              if (iL.le.0) iL = iL + x_fft_size
-              if (iR.le.0) iR = iR + x_fft_size
-              do iky=1,naky
-                fft_xky(iky,iL) = fft_xky(iky,iL)*(1-copy_mask_left(ix)) &
-                                        + g_buffer0(num)*copy_mask_left(ix)
-                                        
-                fft_xky(iky,iR) = fft_xky(iky,iR)*(1-copy_mask_right(ix)) &
-                                        + g_buffer1(num)*copy_mask_right(ix)
-                num=num+1
-              enddo
-            enddo
-            if(smooth_ZFs) then
-              dzm = fft_xky(1,boundary_size+1)            - fft_xky(1,boundary_size)
-              dzp = fft_xky(1,x_fft_size-boundary_size+1) - fft_xky(1,x_fft_size-boundary_size)
-              do ix=1,pfac*boundary_size
-                iL = ix + offsetL
-                iR = ix + offsetR
-                if (iL.le.0) iL = iL + x_fft_size
-                if (iR.le.0) iR = iR + x_fft_size
-                fft_xky(1,iL) = fft_xky(1,iL) + dzm
-                fft_xky(1,iR) = fft_xky(1,iR) - dzp
-              enddo
-            endif
-            if(zonal_mode(1)) fft_xky(1,:) = real(fft_xky(1,:))
-            call transform_x2kx(fft_xky,gin(:,:,iz,it,iv))  
-          enddo
-        enddo
-      enddo
+      !apply the BCs
+      call apply_radial_boundary_conditions (gin)
     endif
 
 ! DSO - change communicator
@@ -660,16 +669,84 @@ contains
 
     deallocate (prefac)
 
+    if (proc0) call time_message(.false.,time_multibox(:,1), ' mb_comm')
+
 #endif
   end subroutine multibox_communicate
+
+  subroutine apply_radial_boundary_conditions (gin)
+
+    use kt_grids, only: nakx, naky, zonal_mode
+    use kt_grids, only: periodic_variation, boundary_size
+    use stella_layouts, only: vmu_lo
+    use zgrid, only: nzgrid
+
+    implicit none
+
+    integer :: num,ix,iky,iz,it,iv, iL, iR
+    integer :: offsetL, offsetR, pfac
+    complex :: dzm,dzp
+
+    complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (inout) :: gin
+
+
+    pfac = 1
+    if (periodic_variation) pfac = 2
+
+    offsetL = 0
+    offsetR = x_fft_size - boundary_size
+    if (periodic_variation) then
+      offsetL = -boundary_size
+      offsetR = x_fft_size/2 - boundary_size + 1
+    endif
+
+    num = 1
+    do iv = vmu_lo%llim_proc, vmu_lo%ulim_proc
+      do it = 1, vmu_lo%ntubes
+        do iz = -vmu_lo%nzgrid, vmu_lo%nzgrid
+          call transform_kx2x(gin(:,:,iz,it,iv),fft_xky)  
+          do ix = 1, pfac*boundary_size
+            iL = ix + offsetL
+            iR = ix + offsetR
+            if (iL.le.0) iL = iL + x_fft_size
+            if (iR.le.0) iR = iR + x_fft_size
+            do iky = ikymin, naky
+              fft_xky(iky,iL) = fft_xky(iky,iL)*(1-copy_mask_left(ix)) &
+                                        + g_buffer0(num)*copy_mask_left(ix)
+                                        
+              fft_xky(iky,iR) = fft_xky(iky,iR)*(1-copy_mask_right(ix)) &
+                                        + g_buffer1(num)*copy_mask_right(ix)
+              num = num + 1
+            enddo
+          enddo
+          if(smooth_ZFs) then
+            dzm = fft_xky(1,boundary_size+1)            - fft_xky(1,boundary_size)
+            dzp = fft_xky(1,x_fft_size-boundary_size+1) - fft_xky(1,x_fft_size-boundary_size)
+            do ix = 1, pfac*boundary_size
+              iL = ix + offsetL
+              iR = ix + offsetR
+              if (iL.le.0) iL = iL + x_fft_size
+              if (iR.le.0) iR = iR + x_fft_size
+              fft_xky(1,iL) = fft_xky(1,iL) + dzm
+              fft_xky(1,iR) = fft_xky(1,iR) - dzp
+            enddo
+          endif
+          if (zonal_mode(1)) fft_xky(1,:) = real(fft_xky(1,:))
+          call transform_x2kx (fft_xky,gin(:,:,iz,it,iv))  
+        enddo
+      enddo
+    enddo
+
+  end subroutine apply_radial_boundary_conditions 
 
   subroutine add_multibox_krook (g, rhs)
 
     use stella_time, only: code_dt
     use stella_layouts, only: vmu_lo
-    use kt_grids, only:  nakx, naky, periodic_variation
+    use kt_grids, only:  nakx, naky, periodic_variation, boundary_size
     use zgrid, only: nzgrid, ntubes
-    use mp, only: job
+    use mp, only: job, proc0
+    use job_manage, only: time_message
 
 
     implicit none
@@ -681,7 +758,9 @@ contains
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: rhs
 
     complex, allocatable, dimension (:,:) :: g0x, g0k
-    if(job /= 1) return
+    if(job /= 1.and..not.use_dirichlet_BC) return
+
+    if (proc0) call time_message(.false.,time_multibox(:,2), ' mb_krook')
 
     allocate (g0k(naky,nakx))
     allocate (g0x(naky,x_fft_size))
@@ -697,21 +776,21 @@ contains
     pfac = 1
     if (periodic_variation) pfac = 2
 
-    num=1
+    num = 1
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
       do it = 1, ntubes
         do iz = -nzgrid, nzgrid
           g0x = 0.0
           call transform_kx2x(g(:,:,iz,it,ivmu),fft_xky)  
-          do ix=1,pfac*boundary_size
+          do ix = 1, pfac*boundary_size
             iL = ix + offsetL
             iR = ix + offsetR
             if (iL.le.0) iL = iL + x_fft_size
             if (iR.le.0) iR = iR + x_fft_size
-            do iky=1,naky
+            do iky = ikymin, naky
                 g0x(iky,iL) = (fft_xky(iky,iL) - g_buffer0(num))*krook_mask_left(ix)
                 g0x(iky,iR) = (fft_xky(iky,iR) - g_buffer1(num))*krook_mask_right(ix)
-                num=num+1
+                num = num + 1
             enddo
           enddo
           call transform_x2kx(g0x,g0k)  
@@ -723,6 +802,8 @@ contains
 
     deallocate(g0k,g0x)
 
+    if (proc0) call time_message(.false.,time_multibox(:,2), ' mb_krook')
+
   end subroutine add_multibox_krook
 
 !!
@@ -730,7 +811,7 @@ contains
 !!       It is done here because the radial grid may include an extra point
 
   subroutine init_mb_get_phi(has_elec, adiabatic_elec,efac,efacp)
-    use kt_grids, only:  nakx, naky
+    use kt_grids, only:  nakx, naky, boundary_size
     use zgrid, only: nzgrid
     use physics_flags, only: radial_variation
     use stella_geometry, only: dl_over_b, d_dl_over_b_drho
@@ -849,7 +930,7 @@ contains
 
   subroutine mb_get_phi(phi,has_elec,adiabatic_elec)
     use constants, only: zi
-    use kt_grids, only:  akx, nakx, naky, zonal_mode
+    use kt_grids, only:  akx, nakx, naky, zonal_mode, boundary_size
     use zgrid, only: nzgrid, ntubes
     use stella_geometry, only: dl_over_b, d_dl_over_b_drho
     use run_parameters, only: ky_solve_radial
@@ -977,8 +1058,6 @@ contains
                     g0z((1+b_solve):(x_fft_size-b_solve),iz) + pb_fsa
           endif
         enddo
-
-
 
         ! get <A_p^-1.(g- - A_b.phi_b)>_psi
         g_fsa = 0.0

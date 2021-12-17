@@ -329,37 +329,39 @@ contains
 
     complex, dimension (:,:,:), allocatable :: g0v
     complex, dimension (:,:,:,:,:), allocatable :: g0x
-
-    integer :: iv
+    complex, dimension (:,:), allocatable :: dgdv
+    
+    integer :: iv, ikxyz
 
     if (proc0) call time_message(.false.,time_mirror(:,1),' Mirror advance')
 
-    ! the mirror term is most complicated of all when doing full flux surface
     if (full_flux_surface) then
        if ((fapar > epsilon(0.)) .or. (fbpar > epsilon(0.))) then
           call mp_abort ('full_flux_surface mirror term not set up for apar, bpar. aborting')
        end if
        allocate (g0v(nvpa,nmu,kxyz_lo%llim_proc:kxyz_lo%ulim_alloc))
        allocate (g0x(ny,nakx,-nzgrid:nzgrid,ntubes,vmu_lo%llim_proc:vmu_lo%ulim_alloc))
-
-       ! for upwinding, need to evaluate dh/dvpa in y-space
-       ! first must take h(ky) and transform to h(y)
+       allocate (dgdv(nvpa,nmu))
+       
+       ! for upwinding of vpa, need to evaluate dg/dvpa in y-space
+       ! this is necessary because the advection speed contains dB/dz, which depends on y
+       ! first must take g(ky) and transform to g(y)
        call transform_ky2y (g, g0x)
-       ! second, remap h so velocities are local
+       ! second, remap g so velocities are local
        call scatter (kxyz2vmu, g0x, g0v)
-       ! next, calculate dh/dvpa
-       call get_dgdvpa_global (g0v)
-       ! add in extra term coming from definition of h as h*exp(mu*B/T)
-
-       ! FLAG -- NEED TO REPLACE GVMU BELOW !!!
-       do iv = 1, nvpa
-          g0v(iv,:,:) = g0v(iv,:,:) + 2.0*vpa(iv)*gvmu(iv,:,:)
+       ! next, calculate dg/dvpa
+       do ikxyz = kxyz_lo%llim_proc, kxyz_lo%ulim_proc
+          dgdv = g0v(:,:,ikxyz)
+          call get_dgdvpa_annulus (dgdv, ikxyz)
+          do iv = 1, nvpa
+             g0v(iv,:,ikxyz) = dgdv(iv,:) + 2.0*vpa(iv)*g0v(iv,:,ikxyz)
+          end do
        end do
-
        ! then take the results and remap again so y,kx,z local.
        call gather (kxyz2vmu, g0v, g0x)
        ! finally add the mirror term to the RHS of the GK eqn
-       call add_mirror_term_global (g0x, gout)
+       call add_mirror_term_annulus (g0x, gout)
+       deallocate (dgdv)
     else
        allocate (g0v(nvpa,nmu,kxkyz_lo%llim_proc:kxkyz_lo%ulim_alloc))
        allocate (g0x(naky,nakx,-nzgrid:nzgrid,ntubes,vmu_lo%llim_proc:vmu_lo%ulim_alloc))
@@ -451,7 +453,7 @@ contains
 
   end subroutine add_mirror_radial_variation
 
-  subroutine get_dgdvpa_global (g)
+  subroutine get_dgdvpa_annulus (g, ikxyz)
 
     use finite_differences, only: third_order_upwind, second_order_centered
     use stella_layouts, only: kxyz_lo, iz_idx, iy_idx, is_idx
@@ -460,25 +462,24 @@ contains
 
     implicit none
 
-    complex, dimension (:,:,kxyz_lo%llim_proc:), intent (in out) :: g
-
-    integer :: ikxyz, imu, iz, iy, is
+    complex, dimension (:,:), intent (in out) :: g
+    integer, intent (in) :: ikxyz
+    
+    integer :: imu, iz, iy, is
     complex, dimension (:), allocatable :: tmp
 
     allocate (tmp(nvpa))
-    do ikxyz = kxyz_lo%llim_proc, kxyz_lo%ulim_proc
-       iz = iz_idx(kxyz_lo,ikxyz)
-       iy = iy_idx(kxyz_lo,ikxyz)
-       is = is_idx(kxyz_lo,ikxyz)
-       do imu = 1, nmu
-          ! tmp is dh/dvpa
-          call third_order_upwind (1,g(:,imu,ikxyz),dvpa,mirror_sign(iy,iz),tmp)
-          g(:,imu,ikxyz) = tmp
-       end do
+    iz = iz_idx(kxyz_lo,ikxyz)
+    iy = iy_idx(kxyz_lo,ikxyz)
+    is = is_idx(kxyz_lo,ikxyz)
+    do imu = 1, nmu
+       ! tmp is dg/dvpa
+       call third_order_upwind (1,g(:,imu),dvpa,mirror_sign(iy,iz),tmp)
+       g(:,imu) = tmp
     end do
     deallocate (tmp)
 
-  end subroutine get_dgdvpa_global
+  end subroutine get_dgdvpa_annulus
 
   subroutine get_dgdvpa_explicit (g)
 
@@ -536,7 +537,7 @@ contains
     complex, dimension (:,:,-nzgrid:,:), intent (in) :: apar
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: imu, is, ivmu
+    integer :: imu, is, ivmu, it, iz, ikx
     complex, dimension (:,:,:,:), allocatable :: gyro_apar
 
     allocate(gyro_apar(naky,nakx,-nzgrid:nzgrid,ntubes))
@@ -545,21 +546,20 @@ contains
        imu = imu_idx(vmu_lo,ivmu)
        is = is_idx(vmu_lo,ivmu)
        call gyro_average(apar, ivmu, gyro_apar)
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) &
-                           + spread(spread(spread(mirror(1,:,imu,is),1,naky),2,nakx),4,ntubes)*g(:,:,:,:,ivmu) &
-                           + spread(spread(spread(mirror_apar_fac(1,:,ivmu),1,naky),2,nakx),4,ntubes) &
-                           *gyro_apar(:,:,:,:) ! May need to spread by 1 over column 5
-       ! mirror_apar_fac is a fn of (ia, iz, ivmu)
-       ! Want to get it as a function of (ky, kx, iz, tube, ivmu)
-       ! So take ia=1 and spread nky over 1, nkx over 2, ntubes over 4
-       ! gyro_apar a function of
-    end do
-
+       do it = 1, ntubes
+         do iz = -nzgrid, nzgrid
+           do ikx = 1, nakx
+              src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + mirror(1,iz,imu,is)*g(:,ikx,iz,it,ivmu) + &
+                   gyro_apar(:, ikx, iz, it) * mirror_apar_fac(1, :, ivmu)
+           enddo
+         enddo
+       enddo
+    enddo
     deallocate(gyro_apar)
 
   end subroutine add_mirror_term
 
-  subroutine add_mirror_term_global (g, src)
+  subroutine add_mirror_term_annulus (g, src)
 
     use stella_layouts, only: vmu_lo
     use stella_layouts, only: imu_idx, is_idx
@@ -571,15 +571,21 @@ contains
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in) :: g
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: imu, is, ivmu
+    integer :: imu, is, ivmu, it, iz, ikx
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
        imu = imu_idx(vmu_lo,ivmu)
        is = is_idx(vmu_lo,ivmu)
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) + spread(spread(mirror(:,:,imu,is),2,nakx),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+       do it = 1, ntubes
+         do iz = -nzgrid, nzgrid
+           do ikx = 1, nakx
+             src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + mirror(:,iz,imu,is)*g(:,ikx,iz,it,ivmu)
+           enddo
+         enddo
+       enddo
+    enddo
 
-  end subroutine add_mirror_term_global
+  end subroutine add_mirror_term_annulus
 
   ! advance mirror implicit solve dg/dt = mu/m * bhat . grad B (dg/dvpa + m*vpa/T * g)
   subroutine advance_mirror_implicit (collisions_implicit, g)
@@ -609,7 +615,7 @@ contains
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: g
 
     integer :: ikxyz, ikxkyz, ivmu
-    integer :: iv, imu, iz, is
+    integer :: iv, imu, iz, is, ikx, it
     real :: tupwnd
     complex, dimension (:,:,:), allocatable :: g0v
     complex, dimension (:,:,:,:,:), allocatable :: g0x
@@ -649,8 +655,14 @@ contains
        ! if dphinc/dz=0, simplifies to exp(m*vpa^2/2T)
        if (include_neoclassical_terms) then
           do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-             g0x(:,:,:,:,ivmu) = g0x(:,:,:,:,ivmu)*spread(spread(mirror_int_fac(:,:,ivmu),2,nakx),4,ntubes)
-          end do
+            do it = 1, ntubes
+              do iz = -nzgrid, nzgrid
+                do ikx = 1, nakx
+                  g0x(:,ikx,iz,it,ivmu) = g0x(:,ikx,iz,it,ivmu)*mirror_int_fac(:,iz,ivmu)
+                enddo
+              enddo
+            enddo
+          enddo
        else
           do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
              iv = iv_idx(vmu_lo,ivmu)
@@ -676,7 +688,13 @@ contains
        ! if dphinc/dz=0, simplifies to exp(m*vpa^2/2T)
        if (include_neoclassical_terms) then
           do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-             g0x(:,:,:,:,ivmu) = g0x(:,:,:,:,ivmu)/spread(spread(mirror_int_fac(:,:,ivmu),2,nakx),4,ntubes)
+            do it = 1, ntubes
+              do iz = -nzgrid, nzgrid
+                do ikx = 1, nakx
+                  g0x(:,ikx,iz,it,ivmu) = g0x(:,ikx,iz,it,ivmu)/mirror_int_fac(:,iz,ivmu)
+                enddo
+              enddo
+            enddo
           end do
        else
           do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc

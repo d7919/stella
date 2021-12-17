@@ -359,7 +359,8 @@ check: check-unit check-integrated
 #.PRECIOUS: $(F90FROMFPP)
 
 .INTERMEDIATE: $(GK_PROJECT)_transforms.f90 $(GK_PROJECT)_io.f90 $(GK_PROJECT)_save.f90 \
-		mp.f90 fft_work.f90 response_matrix.f90 multibox.f90
+		mp.f90 fft_work.f90 response_matrix.f90 multibox.f90 sources.f90 \
+		fields.f90 mp_lu_decomposition.f90
 
 ############################################################# MORE DIRECTIVES
 
@@ -446,7 +447,7 @@ check_ford_install:
 	@echo "Ford command $(FORD) not in path -- is it installed?\\n\\tConsider installing with 'pip install --user ford' and add ${HOME}/.local/bin to PATH" ; which $(FORD)
 endif
 
-GIT_VERSION := $(shell git describe --tags --long --match "v*" --first-parent HEAD)
+GIT_VERSION := $(shell git describe --tags --always --long --match "v*" --first-parent HEAD)
 
 doc: docs/stella_docs.md check_ford_install
 	$(FORD) $(INC_FLAGS) -r $(GIT_VERSION) $<

@@ -4,7 +4,7 @@
 
 module dist_fn_arrays
 
-  public :: gnew, gold
+  public :: gnew, gold, g_symm
   public :: g0, g1, g2, g3
   public :: g_krook, g_proj
   public :: gvmu
@@ -14,10 +14,12 @@ module dist_fn_arrays
   public :: wdriftx_phi, wdrifty_phi
   public :: wdriftpx_g, wdriftpy_g
   public :: wdriftpx_phi, wdriftpy_phi
-  ! public :: adiabatic_phi
 
   ! dist fn
   complex, dimension (:,:,:,:,:), allocatable :: gnew, gold
+  ! (naky, nakx, -nzgrid:nzgrid, ntubes, -vmu-layout-)
+
+  complex, dimension (:,:,:,:,:), target, allocatable :: g_symm
   ! (naky, nakx, -nzgrid:nzgrid, ntubes, -vmu-layout-)
 
   complex, dimension (:,:,:,:,:), allocatable :: g0, g1, g2, g3
