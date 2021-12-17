@@ -3,7 +3,7 @@ program stella
   use mp, only: proc0
   use redistribute, only: scatter
   use job_manage, only: time_message, checkstop, job_fork
-  use run_parameters, only: nstep, fphi, fapar, fbpar
+  use run_parameters, only: nstep, tend, fphi, fapar, fbpar
   use stella_time, only: update_time, code_time, code_dt
   use dist_redistribute, only: kxkyz2vmu
   use time_advance, only: advance_stella
@@ -47,8 +47,11 @@ program stella
 
   ! Advance stella until istep=nstep
   if (debug) write(*,*) 'stella::advance_stella'
-  do istep = (istep0+1), nstep
+  istep = istep0+1
+  do while ((code_time<=tend .AND. tend>0) .OR. (istep<=nstep .AND. nstep>0)) 
      if (debug) write(*,*) 'istep = ', istep
+     if (mod(istep,10)==0) call checkstop (stop_stella)
+     if (stop_stella) exit
      call advance_stella(istep)
      call update_time
      if (nsave > 0 .and. mod(istep,nsave)==0) then
@@ -58,10 +61,9 @@ program stella
      call time_message(.false.,time_diagnostics,' diagnostics')
      call diagnose_stella (istep)
      call time_message(.false.,time_diagnostics,' diagnostics')
-     if (mod(istep,10)==0) call checkstop (stop_stella)
-     if (stop_stella) exit
      ierr = error_unit()
      call flush_output_file (ierr)
+     istep = istep+1
   end do
 
   ! Finish stella
@@ -119,8 +121,10 @@ contains
     use stella_save, only: init_dt
     use multibox, only: read_multibox_parameters, init_multibox, rhoL, rhoR
     use multibox, only: communicate_multibox_parameters, multibox_communicate
+    use multibox, only: use_dirichlet_BC, apply_radial_boundary_conditions
     use ran, only: get_rnd_seed_length, init_ranf
     use dissipation, only: init_dissipation
+    use sources, only: init_sources
     use volume_averages, only: init_volume_averages, volume_average
 
     implicit none
@@ -140,6 +144,7 @@ contains
     ! initialize mpi message passing
     if (.not.mpi_initialized) call init_mp
     mpi_initialized = .true.
+    debug = debug .and. proc0
 
     ! initialize timer
     if (debug) write (*,*) 'stella::init_stella::check_time'
@@ -152,15 +157,19 @@ contains
        ! initialize file i/o
        if (debug) write (*,*) 'stella::init_stella::init_file_utils'
        call init_file_utils (list)
-       call time_message(.false.,time_total,' Total')
-       call time_message(.false.,time_init,' Initialization')
     end if
 
     call broadcast (list)
     call broadcast (runtype_option_switch)
     if(list) call job_fork
 
+    !proc0 may have changed
     debug = debug .and. proc0
+
+    if (proc0) then
+       call time_message(.false.,time_total,' Total')
+       call time_message(.false.,time_init,' Initialization')
+    endif
 
     if (proc0) cbuff = trim(run_name)
     call broadcast (cbuff)
@@ -175,12 +184,12 @@ contains
     call init_zgrid
     if (debug) write (6,*) "stella::init_stella::read_species_knobs"
     call read_species_knobs
-    if (debug) write (6,*) "stella::init_stella::read_multibox_parameters"
+    if (debug) write (6,*) "stella::init_stella::read_kt_grids_parameters"
     call read_kt_grids_parameters
     if (debug) write (6,*) "stella::init_stella::read_vpamu_grids_parameters"
-    call read_multibox_parameters
-    if (debug) write (6,*) "stella::init_stella::read_kt_grids_parameters"
     call read_vpamu_grids_parameters
+    if (debug) write (6,*) "stella::init_stella::read_multibox_parameters"
+    call read_multibox_parameters
     if (debug) write (6,*) "stella::init_stella::init_dist_fn_layouts"
     call init_dist_fn_layouts (nzgrid, ntubes, naky, nakx, nvgrid, nmu, nspec, ny, nx, nalpha)
     if (debug) write(6,*) "stella::init_stella::init_geometry"
@@ -250,6 +259,8 @@ contains
     call init_redistribute
     if (debug) write (6,*) 'stella::init_stella::init_dissipation'
     call init_dissipation
+    if (debug) write (6,*) 'stella::init_stella::init_sources'
+    call init_sources
     if (debug) write (6,*) 'stella::init_stella::init_fields'
     call init_fields
     if (debug) write(6,*) "stella::init_stella::ginit"
@@ -280,14 +291,23 @@ contains
     if (debug) write (6,*) 'stella::init_stella::get_fields'
     ! get initial field from initial distribution function
     call advance_fields (gnew, phi, apar, bpar, dist='gbar')
-    if(radial_variation) call get_radial_correction(gnew,phi,dist='gbar')
+    if(radial_variation) then
+      if (debug) write (6,*) 'stella::init_stella::get_radial_correction'
+      call get_radial_correction(gnew,phi,dist='gbar')
+    endif
 
-    if(runtype_option_switch.eq.runtype_multibox) then
+    if (runtype_option_switch.eq.runtype_multibox) then
+      if (debug) write (6,*) 'stella::init_stella:multibox_communicate'
       call multibox_communicate (gnew)
       if(job.eq.1) then
         fields_updated=.false.
         call advance_fields (gnew, phi, apar, bpar, dist='gbar')
       endif
+    else if (use_dirichlet_BC) then
+      if (debug) write (6,*) 'stella::init_stella:multibox_radial_BC'
+      call apply_radial_boundary_conditions (gnew)
+      fields_updated=.false.
+      call advance_fields (gnew, phi, apar, bpar, dist='gbar')
     endif
 
     ! FLAG - the following code should probably go elsewhere
@@ -332,7 +352,6 @@ contains
     if (proc0) then
       write (*,*) ' '
       write (*,*) ' '
-      write (*,*) ''//achar(27)//'[32m'
       write (*,*) "            I8            ,dPYb, ,dPYb,            "
       write (*,*) "            I8            IP'`Yb IP'`Yb            "
       write (*,*) "         88888888         I8  8I I8  8I            "
@@ -342,16 +361,14 @@ contains
       write (*,*) " ,8'  Yb   ,I8,  I8, ,8I  I8P    I8P    i8'    ,8I "
       write (*,*) ",8'_   8) ,d88b, `YbadP' ,d8b,_ ,d8b,_ ,d8,   ,d8b,"
       write (*,*) 'P` "YY8P8P8P""Y8888P"Y8888P`"Y888P`"Y88P"Y8888P"`Y8'
-      write (*,*) ''//achar(27)//'[0m'
       write (*,*) ' '
       write (*,*) ' '
       write (*,*) '                       Version ', VERNUM
       write (*,*) '                        ', VERDATE
       write (*,*) ' '
-      write (*,*) '                   Add author names.,'
-      write (*,*) '                  More author names...,'
+      write (*,*) '                     The stella team'
       write (*,*) ' '
-      write (*,*) '                   Add institutions...'
+      write (*,*) '                   University of Oxford'
       write (*,*) ' '
       write (*,*) ' '
       write (*,'(A)') "############################################################"
@@ -378,7 +395,7 @@ contains
     use job_manage, only: time_message
     use physics_parameters, only: finish_physics_parameters
     use physics_flags, only: finish_physics_flags
-    use run_parameters, only: finish_run_parameters, nstep
+    use run_parameters, only: finish_run_parameters
     use zgrid, only: finish_zgrid
     use species, only: finish_species
     use time_advance, only: time_gke, time_parallel_nl
@@ -386,6 +403,7 @@ contains
     use parallel_streaming, only: time_parallel_streaming
     use mirror_terms, only: time_mirror
     use dissipation, only: time_collisions
+    use sources, only: finish_sources, time_sources
     use init_g, only: finish_init_g
     use dist_fn, only: finish_dist_fn
     use dist_redistribute, only: finish_redistribute
@@ -399,13 +417,14 @@ contains
     use vpamu_grids, only: finish_vpamu_grids
     use kt_grids, only: finish_kt_grids
     use volume_averages, only: finish_volume_averages
+    use multibox, only: finish_multibox, time_multibox
 
     implicit none
 
     logical, intent (in), optional :: last_call
 
     if (debug) write (*,*) 'stella::finish_stella::finish_stella_diagnostics'
-    call finish_stella_diagnostics(nstep)
+    call finish_stella_diagnostics(istep)
     if (debug) write (*,*) 'stella::finish_stella::finish_response_matrix'
     call finish_response_matrix
     if (debug) write (*,*) 'stella::finish_stella::finish_z_equation'
@@ -414,10 +433,14 @@ contains
     call finish_fields
     if (debug) write (*,*) 'stella::finish_stella::finish_time_advance'
     call finish_time_advance
+    if (debug) write (*,*) 'stella::finish_stella::finish_sources'
+    call finish_sources
     if (debug) write (*,*) 'stella::finish_stella::finish_volume_averages'
     call finish_volume_averages
     if (debug) write (*,*) 'stella::finish_stella::finish_extended_zgrid'
     call finish_extended_zgrid
+    if (debug) write (*,*) 'stella::finish_stella::finish_multibox'
+    call finish_multibox
     if (debug) write (*,*) 'stella::finish_stella::finish_dist_fn'
     call finish_dist_fn
     if (debug) write (*,*) 'stella::finish_stella::finish_redistribute'
@@ -452,6 +475,9 @@ contains
        write (*,fmt=101) 'diagnostics:', time_diagnostics(1)/60., 'min'
        write (*,fmt=101) 'fields:', time_field_solve(1,1)/60., 'min'
        write (*,fmt=101) '(redistribute):', time_field_solve(1,2)/60., 'min'
+       write (*,fmt=101) '(int_dv_g):', time_field_solve(1,3)/60., 'min'
+       write (*,fmt=101) '(get_phi):', time_field_solve(1,4)/60., 'min'
+       write (*,fmt=101) '(phi_adia_elec):', time_field_solve(1,5)/60., 'min'
        write (*,fmt=101) 'mirror:', time_mirror(1,1)/60., 'min'
        write (*,fmt=101) '(redistribute):', time_mirror(1,2)/60., 'min'
        write (*,fmt=101) 'stream:', time_parallel_streaming(1)/60., 'min'
@@ -460,10 +486,14 @@ contains
        write (*,fmt=101) 'wstar:', time_gke(1,6)/60., 'min'
        write (*,fmt=101) 'collisions:', time_collisions(1,1)/60., 'min'
        write (*,fmt=101) '(redistribute):', time_collisions(1,2)/60., 'min'
+       write (*,fmt=101) 'sources:', time_sources(1,1)/60., 'min'
+       write (*,fmt=101) '(redistribute):', time_sources(1,2)/60., 'min'
        write (*,fmt=101) 'ExB nonlin:', time_gke(1,7)/60., 'min'
        write (*,fmt=101) 'parallel nonlin:', time_parallel_nl(1,1)/60., 'min'
        write (*,fmt=101) '(redistribute):', time_parallel_nl(1,2)/60., 'min'
        write (*,fmt=101) 'radial var:', time_gke(1,10)/60., 'min'
+       write (*,fmt=101) 'multibox comm:', time_multibox(1,1)/60., 'min'
+       write (*,fmt=101) 'multibox krook:', time_multibox(1,2)/60., 'min'
        write (*,fmt=101) 'total implicit: ', time_gke(1,9)/60., 'min'
        write (*,fmt=101) 'total explicit: ', time_gke(1,8)/60., 'min'
        write (*,fmt=101) 'total:', time_total(1)/60., 'min'

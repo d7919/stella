@@ -15,12 +15,14 @@ module stella_io
   public :: write_time_nc
   public :: write_phi2_nc
   public :: write_phi_nc
-  public :: write_bpar2_nc
+  public :: write_apar2_nc
+  public :: write_bpar2_nc  
   public :: write_gvmus_nc
   public :: write_gzvs_nc
   public :: write_kspectra_nc
   public :: write_moments_nc
   public :: write_radial_fluxes_nc
+  public :: write_radial_moments_nc
   public :: write_fluxes_kxkyz_nc
   public :: get_nout
   public :: sync_nc
@@ -44,11 +46,12 @@ module stella_io
   integer :: nakx_id, ntubes_id
   integer :: naky_id, nttot_id, akx_id, aky_id, zed_id, nspec_id
   integer :: nmu_id, nvtot_id, mu_id, vpa_id
-  integer :: time_id, phi2_id, bpar2_id, theta0_id, nproc_id, nmesh_id
+  integer :: time_id, phi2_id, apar2_id, bpar2_id, theta0_id, nproc_id, nmesh_id
   integer :: phi_vs_t_id, phi2_vs_kxky_id
+  integer :: dens_x_id, upar_x_id, temp_x_id
   integer :: pflux_x_id, vflux_x_id, qflux_x_id
   integer :: pflx_kxkyz_id, vflx_kxkyz_id, qflx_kxkyz_id
-  integer :: density_id, upar_id, temperature_id
+  integer :: density_id, upar_id, temperature_id, spitzer2_id
   integer :: gvmus_id, gzvs_id
   integer :: input_id
   integer :: charge_id, mass_id, dens_id, temp_id, tprim_id, fprim_id
@@ -56,7 +59,8 @@ module stella_io
   integer :: bmag_id, gradpar_id, gbdrift_id, gbdrift0_id
   integer :: cvdrift_id, cvdrift0_id, gds2_id, gds21_id, gds22_id
   integer :: kperp2_id, rad_grid_id
-  integer :: grho_id, jacob_id, shat_id, drhodpsi_id, q_id, jtwist_id
+  integer :: grho_id, jacob_id, djacdrho_id, shat_id, drhodpsi_id, q_id, jtwist_id
+  integer :: d2qdr2_id, d2psidr2_id
   integer :: beta_id
   integer :: code_id
 # endif
@@ -71,7 +75,7 @@ contains
   !============ INITIATE STELLA IO ==============
   !==============================================
   subroutine init_stella_io (restart, write_phi_vs_t, write_kspectra, write_gvmus, &
-       write_gzvs, write_moments, write_radial_fluxes, write_fluxes_kxky)
+       write_gzvs, write_moments, write_radial_fluxes, write_radial_moments, write_fluxes_kxky)
 
     use mp, only: proc0
     use file_utils, only: run_name
@@ -86,7 +90,7 @@ contains
 
     logical, intent (in) :: restart
     logical, intent (in) :: write_phi_vs_t, write_kspectra, write_gvmus, write_gzvs
-    logical, intent (in) :: write_moments, write_radial_fluxes!, write_symmetry
+    logical, intent (in) :: write_moments, write_radial_fluxes,write_radial_moments!, write_symmetry
     logical, intent (in) :: write_fluxes_kxky
 # ifdef NETCDF
     character (300) :: filename
@@ -115,7 +119,9 @@ contains
        if (status /= nf90_noerr) call netcdf_error (status, file=filename)
 
        call define_dims
-       call define_vars (write_phi_vs_t, write_kspectra, write_gvmus, write_gzvs, write_moments, write_radial_fluxes, write_fluxes_kxky)
+       call define_vars (write_phi_vs_t, write_kspectra, write_gvmus, write_gzvs, &
+                         write_moments, write_radial_fluxes,write_radial_moments, &
+                         write_fluxes_kxky)
        call nc_grids
        call nc_species
        call nc_geo
@@ -266,10 +272,11 @@ contains
 
   subroutine define_vars (write_phi_vs_t, write_kspectra, write_gvmus, &
 !       write_gzvs, write_symmetry, write_moments)
-       write_gzvs, write_moments, write_radial_fluxes, write_fluxes_kxky)
+       write_gzvs, write_moments, write_radial_fluxes, write_radial_moments, &
+       write_fluxes_kxky)
 
     use mp, only: nproc
-    use run_parameters, only: fphi!, fapar, fbpar
+    use run_parameters, only: fphi, fapar, fbpar
     use physics_flags, only: radial_variation
 # ifdef NETCDF
     use netcdf, only: nf90_char, nf90_int, nf90_global
@@ -281,7 +288,7 @@ contains
     implicit none
 
     logical, intent(in) :: write_phi_vs_t, write_kspectra, write_gvmus, write_gzvs!, write_symmetry
-    logical, intent (in) :: write_moments, write_radial_fluxes
+    logical, intent (in) :: write_moments, write_radial_fluxes, write_radial_moments
     logical, intent (in) :: write_fluxes_kxky
 # ifdef NETCDF
     character (5) :: ci
@@ -692,6 +699,11 @@ contains
       status = nf90_def_var (ncid, 'jacob', netcdf_real, flux_surface_dim, jacob_id)
       if (status /= nf90_noerr) call netcdf_error (status, var='jacob')
     endif
+    status = nf90_inq_varid(ncid,'djacdrho',djacdrho_id)
+    if(status /= nf90_noerr) then
+      status = nf90_def_var (ncid, 'djacdrho', netcdf_real, flux_surface_dim, djacdrho_id)
+      if (status /= nf90_noerr) call netcdf_error (status, var='djacdrho')
+    endif
 
     status = nf90_inq_varid(ncid,'q',q_id)
     if(status /= nf90_noerr) then
@@ -713,6 +725,11 @@ contains
       if (status /= nf90_noerr) call netcdf_error (status, var='shat')
     endif
     status = nf90_put_att (ncid, shat_id, 'long_name', '(rho/q) dq/drho')
+    status = nf90_inq_varid(ncid,'d2qdr2',d2qdr2_id)
+    if(status /= nf90_noerr) then
+      status = nf90_def_var (ncid, 'd2qdr2', netcdf_real, d2qdr2_id)
+      if (status /= nf90_noerr) call netcdf_error (status, var='d2qdr2')
+    endif
     if (status /= nf90_noerr) call netcdf_error (status, ncid, shat_id, att='long_name')
     status = nf90_inq_varid(ncid,'jtwist',jtwist_id)
     if(status /= nf90_noerr) then
@@ -729,6 +746,11 @@ contains
     endif
     status = nf90_put_att (ncid, drhodpsi_id, 'long_name', 'drho/dPsi')
     if (status /= nf90_noerr) call netcdf_error (status, ncid, drhodpsi_id, att='long_name')
+    status = nf90_inq_varid(ncid,'d2psidr2',d2psidr2_id)
+    if(status /= nf90_noerr) then
+      status = nf90_def_var (ncid, 'd2psidr2', netcdf_real, d2psidr2_id)
+      if (status /= nf90_noerr) call netcdf_error (status, var='d2psidr2')
+    endif
 
     if (fphi > zero) then
        status = nf90_inq_varid(ncid,'phi2',phi2_id)
@@ -770,6 +792,26 @@ contains
           status = nf90_put_att (ncid, phi_vs_t_id, 'long_name', 'Electrostatic Potential vs time')
           if (status /= nf90_noerr) call netcdf_error (status, ncid, phi_vs_t_id, att='long_name')
        end if
+       if (write_radial_moments) then
+          status = nf90_inq_varid(ncid,'dens_x',dens_x_id)
+          if(status /= nf90_noerr) then
+            status = nf90_def_var &
+               (ncid, 'dens_x', netcdf_real,flux_x_dim, dens_x_id)
+            if (status /= nf90_noerr) call netcdf_error (status, var='dens_x')
+          endif
+          status = nf90_inq_varid(ncid,'upar_x',upar_x_id)
+          if(status /= nf90_noerr) then
+            status = nf90_def_var &
+               (ncid, 'upar_x', netcdf_real, flux_x_dim, upar_x_id)
+            if (status /= nf90_noerr) call netcdf_error (status, var='upar_x')
+          endif
+          status = nf90_inq_varid(ncid,'temp_x',temp_x_id)
+          if(status /= nf90_noerr) then
+            status = nf90_def_var &
+               (ncid, 'temp_x', netcdf_real, flux_x_dim, temp_x_id)
+            if (status /= nf90_noerr) call netcdf_error (status, var='temp_x')
+          endif
+       end if
        if (write_radial_fluxes) then
           status = nf90_inq_varid(ncid,'pflux_x',pflux_x_id)
           if(status /= nf90_noerr) then
@@ -803,18 +845,32 @@ contains
     end if
 
     !!! Bob: Create bpar2 in output file
-    if (fphi > zero) then
+    if (fbpar > zero) then
        status = nf90_inq_varid(ncid,'bpar2',bpar2_id)
        if(status /= nf90_noerr) then
          status = nf90_def_var (ncid, 'bpar2', netcdf_real, time_dim, bpar2_id)
          if (status /= nf90_noerr) call netcdf_error (status, var='bpar2')
        endif
-       status = nf90_put_att (ncid, bpar2_id, 'long_name', '|Potential**2|')
+       status = nf90_put_att (ncid, bpar2_id, 'long_name', '|B_||**2|')
        if (status /= nf90_noerr) &
             call netcdf_error (status, ncid, bpar2_id, att='long_name')
-       status = nf90_put_att (ncid, bpar2_id, 'units', '(T/q rho/L)**2')
+       status = nf90_put_att (ncid, bpar2_id, 'units', 'TBC')
        if (status /= nf90_noerr) &
             call netcdf_error (status, ncid, bpar2_id, att='units')
+    end if
+
+    if (fapar > zero) then
+       status = nf90_inq_varid(ncid,'apar2',apar2_id)
+       if(status /= nf90_noerr) then
+         status = nf90_def_var (ncid, 'apar2', netcdf_real, time_dim, apar2_id)
+         if (status /= nf90_noerr) call netcdf_error (status, var='apar2')
+       endif
+       status = nf90_put_att (ncid, apar2_id, 'long_name', '|A_||**2|')
+       if (status /= nf90_noerr) &
+            call netcdf_error (status, ncid, apar2_id, att='long_name')
+       status = nf90_put_att (ncid, apar2_id, 'units', 'TBC')
+       if (status /= nf90_noerr) &
+            call netcdf_error (status, ncid, apar2_id, att='units')
     end if
 
     if (write_fluxes_kxky) then
@@ -873,6 +929,15 @@ contains
       endif
       status = nf90_put_att (ncid, temperature_id, 'long_name', 'perturbed temperature vs (ky,kx,z,t)')
       if (status /= nf90_noerr) call netcdf_error (status, ncid, temperature_id, att='long_name')
+
+      status = nf90_inq_varid(ncid,'spitzer2',spitzer2_id)
+      if(status /= nf90_noerr) then
+        status = nf90_def_var &
+          (ncid, 'spitzer2', netcdf_real, moment_dim, spitzer2_id)
+        if (status /= nf90_noerr) call netcdf_error (status, var='spitzer2')
+      endif
+      status = nf90_put_att (ncid, spitzer2_id, 'long_name', 'integral req. for 2. Spitzer coeff')
+      if (status /= nf90_noerr) call netcdf_error (status, ncid, spitzer2_id, att='long_name')
     end if
 
     if (write_gvmus) then
@@ -1031,9 +1096,28 @@ contains
 
   end subroutine write_bpar2_nc
 
+  subroutine write_apar2_nc (nout, apar2)
+
+# ifdef NETCDF
+    use netcdf, only: nf90_put_var
+# endif
+
+    implicit none
+
+    integer, intent (in) :: nout
+    real, intent (in) :: apar2
+
+# ifdef NETCDF
+    integer :: status
+
+    status = nf90_put_var (ncid, apar2_id, apar2, start=(/ nout /))
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, apar2_id)
+# endif
+
+  end subroutine write_apar2_nc
+  
   subroutine write_radial_fluxes_nc (nout, pflux, vflux,qflux)
 
-    use convert, only: c2r
     use kt_grids, only: nakx
     use species, only: nspec
 # ifdef NETCDF
@@ -1064,6 +1148,39 @@ contains
 # endif
 
   end subroutine write_radial_fluxes_nc
+
+  subroutine write_radial_moments_nc (nout,dens_x,upar_x,temp_x)
+
+    use kt_grids, only: nakx
+    use species, only: nspec
+# ifdef NETCDF
+    use netcdf, only: nf90_put_var
+# endif
+
+    implicit none
+
+    integer, intent (in) :: nout
+    real, dimension (:,:), intent (in) :: dens_x, upar_x, temp_x
+
+# ifdef NETCDF
+    integer :: status
+    integer, dimension (3) :: start, count
+
+    start = 1
+    start(3) = nout
+    count(1) = nakx
+    count(2) = nspec
+    count(3) = 1
+
+    status = nf90_put_var (ncid, dens_x_id, dens_x, start=start, count=count)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, dens_x_id)
+    status = nf90_put_var (ncid, upar_x_id, upar_x, start=start, count=count)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, upar_x_id)
+    status = nf90_put_var (ncid, temp_x_id, temp_x, start=start, count=count)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, temp_x_id)
+# endif
+
+  end subroutine write_radial_moments_nc
 
   subroutine write_kspectra_nc (nout, phi2_vs_kxky)
 
@@ -1149,7 +1266,7 @@ contains
 
   end subroutine write_fluxes_kxkyz_nc
 !
-  subroutine write_moments_nc (nout, density, upar, temperature)
+  subroutine write_moments_nc (nout, density, upar, temperature, spitzer2)
 
     use convert, only: c2r
     use zgrid, only: nztot, ntubes
@@ -1162,7 +1279,7 @@ contains
     implicit none
 
     integer, intent (in) :: nout
-    complex, dimension (:,:,:,:,:), intent (in) :: density, upar, temperature
+    complex, dimension (:,:,:,:,:), intent (in) :: density, upar, temperature, spitzer2
 
 # ifdef NETCDF
     integer :: status
@@ -1205,6 +1322,14 @@ contains
     status = NF90_SYNC(ncid)
     if (status /= nf90_noerr) call netcdf_error (status, ncid, temperature_id)
 
+    ! AVB: added: (move this to a separate diagnostic in the future)
+    call c2r (spitzer2, mom_ri)
+    status = nf90_put_var (ncid, spitzer2_id, mom_ri, start=start, count=count)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, spitzer2_id)
+
+!   Buffers to disk
+    status = NF90_SYNC(ncid)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, spitzer2_id)
 
 
     deallocate (mom_ri)
@@ -1406,7 +1531,7 @@ contains
 
     use stella_geometry, only: bmag, gradpar, gbdrift, gbdrift0, &
          cvdrift, cvdrift0, gds2, gds21, gds22, grho, jacob, &
-         drhodpsi
+         drhodpsi, djacdrho
     use stella_geometry, only: geo_surf
     use zgrid, only: nzgrid
     use physics_parameters, only: beta
@@ -1455,6 +1580,8 @@ contains
     if (status /= nf90_noerr) call netcdf_error (status, ncid, grho_id)
     status = nf90_put_var (ncid, jacob_id, jacob, start=start, count=count)
     if (status /= nf90_noerr) call netcdf_error (status, ncid, jacob_id)
+    status = nf90_put_var (ncid, djacdrho_id, djacdrho, start=start, count=count)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, djacdrho_id)
 
     status = nf90_put_var (ncid, beta_id, beta)
     if (status /= nf90_noerr) call netcdf_error (status, ncid, beta_id)
@@ -1462,8 +1589,12 @@ contains
     if (status /= nf90_noerr) call netcdf_error (status, ncid, q_id)
     status = nf90_put_var (ncid, shat_id, geo_surf%shat)
     if (status /= nf90_noerr) call netcdf_error (status, ncid, shat_id)
+    status = nf90_put_var (ncid, d2qdr2_id, geo_surf%d2qdr2)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, d2qdr2_id)
     status = nf90_put_var (ncid, drhodpsi_id, drhodpsi)
     if (status /= nf90_noerr) call netcdf_error (status, ncid, drhodpsi_id)
+    status = nf90_put_var (ncid, d2psidr2_id, geo_surf%d2psidr2)
+    if (status /= nf90_noerr) call netcdf_error (status, ncid, d2psidr2_id)
     status = nf90_put_var (ncid, jtwist_id, jtwist)
     if (status /= nf90_noerr) call netcdf_error (status, ncid, jtwist_id)
 # endif

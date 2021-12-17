@@ -81,6 +81,7 @@ contains
     use dissipation, only: init_collisions, include_collisions
     use mirror_terms, only: init_mirror
     use flow_shear, only: init_flow_shear
+    use sources, only: init_quasineutrality_source, init_source_timeaverage
 
     implicit none
 
@@ -122,6 +123,11 @@ contains
     endif
     if (debug) write (6,*) 'time_advance::init_time_advance::init_cfl'
     call init_cfl
+
+    if (debug) write (6,*) 'time_advance::init_time_advance::init_source_timeaverage'
+    call init_source_timeaverage
+    if (debug) write (6,*) 'time_advance::init_time_advance::init_quasineutrality_source'
+    call init_quasineutrality_source
 
     !call write_drifts
 
@@ -871,6 +877,8 @@ contains
     use flow_shear, only: flow_shear_initialized
     use flow_shear, only: init_flow_shear
     use physics_flags, only: radial_variation
+    use sources, only: init_source_timeaverage
+    use sources, only: init_quasineutrality_source, qn_source_initialized
 
     implicit none
 
@@ -883,15 +891,32 @@ contains
     flow_shear_initialized = .false.
     mirror_initialized = .false.
     parallel_streaming_initialized = .false.
+    qn_source_initialized = .false.
 
+    if (debug) write (6,*) 'time_advance::reset_dt::init_wstar'
     call init_wstar
+    if (debug) write (6,*) 'time_advance::reset_dt::init_wdrift'
     call init_wdrift
+    if (debug) write (6,*) 'time_advance::reset_dt::init_mirror'
     call init_mirror
+    if (debug) write (6,*) 'time_advance::reset_dt::init_z_equation'
     call init_z_equation
+    if (debug) write (6,*) 'time_advance::reset_dt::init_flow_shear'
     call init_flow_shear
-    if (radial_variation) call init_radial_variation
-    if (drifts_implicit .and. .not.drifts_implicit_in_z) call init_drifts_implicit
+    if (debug) write (6,*) 'time_advance::reset_dt::init_source_timeaverage'
+    call init_source_timeaverage
+    if (debug) write (6,*) 'time_advance::reset_dt::init_quasineutrality_source'
+    call init_quasineutrality_source
+    if (radial_variation) then
+      if (debug) write (6,*) 'time_advance::reset_dt::init_radial_variation'
+      call init_radial_variation
+    endif
+    if (drifts_implicit .and. .not.drifts_implicit_in_z) then
+      if (debug) write (6,*) 'time_advance::reset_dt::init_drifts_implicit'
+      call init_drifts_implicit
+    endif
     if (include_collisions) then
+      if (debug) write (6,*) 'time_advance::reset_dt::init_collisions'
       collisions_initialized = .false.
       call init_collisions
     endif
@@ -899,6 +924,7 @@ contains
     ! before it has been initialized the first time
     if (implicit_in_z .and. response_matrix_initialized) then
        response_matrix_initialized = .false.
+       if (debug) write (6,*) 'time_advance::reset_dt::init_response_matrix'
        call init_response_matrix
     end if
 
@@ -912,16 +938,14 @@ contains
     use fields, only: advance_fields, fields_updated
     use run_parameters, only: fully_explicit
     use multibox, only: RK_step
-    use dissipation, only: include_krook_operator, update_delay_krook
-    use dissipation, only: remove_zero_projection, project_out_zero
-    use zgrid, only: nzgrid, ntubes
+    use sources, only: include_krook_operator, update_tcorr_krook
+    use sources, only: include_qn_source, update_quasineutrality_source
+    use sources, only: remove_zero_projection, project_out_zero
     use kt_grids, only: nakx
-    use stella_layouts, only: vmu_lo
 
     implicit none
 
     integer, intent (in) :: istep
-    complex, allocatable, dimension (:,:,:,:) :: g1
 
     if(.not.RK_step) then
       if (debug) write (*,*) 'time_advance::multibox'
@@ -950,20 +974,18 @@ contains
     end if
 
     if(remove_zero_projection) then
-      allocate (g1(nakx,-nzgrid:nzgrid,ntubes,vmu_lo%llim_proc:vmu_lo%ulim_alloc))
-      g1 = gnew(1,:,:,:,:) - gold(1,:,:,:,:)
-      call project_out_zero(g1)
-      gnew(1,:,:,:,:) = gnew(1,:,:,:,:) - g1
-      deallocate (g1)
+      call project_out_zero(gold, gnew)
+      fields_updated = .false.
     end if
-
-    !update the delay parameters for the Krook operator
-    if(include_krook_operator) call update_delay_krook(gnew)
 
     gold = gnew
 
     ! Ensure fields are updated so that omega calculation is correct.
     call advance_fields (gnew, phi, apar, bpar, dist='gbar')
+
+    !update the delay parameters for the Krook operator
+    if(include_krook_operator) call update_tcorr_krook(gnew)
+    if(include_qn_source) call update_quasineutrality_source
 
   end subroutine advance_stella
 
@@ -1201,17 +1223,16 @@ contains
     use kt_grids, only: nakx, ny
     use run_parameters, only: stream_implicit, mirror_implicit, drifts_implicit
     use dissipation, only: include_collisions, advance_collisions_explicit, collisions_implicit
-    use dissipation, only: include_krook_operator, add_krook_operator
+    use sources, only: include_krook_operator, add_krook_operator
     use parallel_streaming, only: advance_parallel_streaming_explicit
     use fields, only: advance_fields, fields_updated, get_radial_correction
     use mirror_terms, only: advance_mirror_explicit
     use flow_shear, only: advance_parallel_flow_shear
-    use file_utils, only: runtype_option_switch, runtype_multibox
     use multibox, only: include_multibox_krook, add_multibox_krook
 
     implicit none
 
-    complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in) :: gin
+    complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (inout) :: gin
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (out), target :: rhs_ky
     logical, intent (out) :: restart_time_step
 
@@ -1220,11 +1241,19 @@ contains
 
     rhs_ky = 0.
 
+    ! if full_flux_surface = .true., then initially obtain the RHS of the GKE in alpha-space;
+    ! will later inverse Fourier transform to get RHS in k_alpha-space
     if (full_flux_surface) then
+       ! rhs_ky will always be needed as the array returned by the subroutine,
+       ! but intermediate array rhs_y (RHS of gke in alpha-space) only needed for full_flux_surface = .true.
        allocate (rhs_y(ny,nakx,-nzgrid:nzgrid,ntubes,vmu_lo%llim_proc:vmu_lo%ulim_alloc))
        rhs_y = 0.
+       ! rhs is array referred to for both flux tube and full-flux-surface simulations;
+       ! for full-flux-surface it should point to rhs_y
        rhs => rhs_y
     else
+       ! rhs is array referred to for both flux tube and full-flux-surface simulations;
+       ! for flux tube it should point to rhs_ky
        rhs => rhs_ky
     end if
 
@@ -1261,19 +1290,23 @@ contains
          ! calculate and add psi-component of magnetic drift term to RHS of GK eqn
          call advance_wdriftx_explicit (gin, phi, apar, bpar, rhs)
          ! calculate and add omega_* term to RHS of GK eqn
-         call advance_wstar_explicit (rhs)
+         call advance_wstar_explicit (phi, rhs)
        endif
 
+       ! calculate and add contribution from collisions to RHS of GK eqn
        if (include_collisions.and..not.collisions_implicit) call advance_collisions_explicit (gin, phi, rhs)
 
+       ! calculate and add parallel streaming term to RHS of GK eqn
+       if (include_parallel_streaming.and.(.not.stream_implicit)) &
+            call advance_parallel_streaming_explicit (gin, phi, rhs)
+
+       ! if simulating a full flux surface (flux annulus), all terms to this point have been calculated
+       ! in real-space in alpha (y); transform to kalpha (ky) space before adding to RHS of GKE.
+       ! NB: it may be that for fully explicit calculation, this transform can be eliminated with additional code changes
        if (full_flux_surface) then
           call transform_y2ky (rhs_y, rhs_ky)
           deallocate (rhs_y)
        end if
-
-       ! calculate and add parallel streaming term to RHS of GK eqn
-       if (include_parallel_streaming.and.(.not.stream_implicit)) &
-            call advance_parallel_streaming_explicit (gin, rhs_ky)
 
        if (radial_variation) then
           if ((fapar .gt. 0) .or. (fbpar .gt. 0)) then
@@ -1284,14 +1317,8 @@ contains
        end if
        if (include_krook_operator) call add_krook_operator(gin,rhs)
 
-       if (runtype_option_switch == runtype_multibox .and. include_multibox_krook) &
-         call add_multibox_krook(gin,rhs)
+       if (include_multibox_krook) call add_multibox_krook(gin,rhs)
 
-       ! calculate and add omega_* term to RHS of GK eqn
-!       if (wstar_explicit) call advance_wstar_explicit (rhs_ky)
-!       call advance_wstar_explicit (rhs_ky)
-       ! calculate and add collision term to RHS of GK eqn
-       !    call advance_collisions
     end if
 
     fields_updated = .false.
@@ -1300,32 +1327,40 @@ contains
 
   end subroutine solve_gke
 
-  subroutine advance_wstar_explicit (gout)
+  subroutine advance_wstar_explicit (phi, gout)
 
     use mp, only: proc0, mp_abort
     use job_manage, only: time_message
     use fields, only: get_dchidy
-    use fields_arrays, only: phi, apar, bpar
+    use fields_arrays, only: apar, bpar
     use stella_layouts, only: vmu_lo
+    use stella_transforms, only: transform_ky2y
     use zgrid, only: nzgrid, ntubes
-    use kt_grids, only: naky, nakx
+    use kt_grids, only: naky, nakx, ny
     use physics_flags, only: full_flux_surface
 
     implicit none
 
+    complex, dimension (:,:,-nzgrid:,:), intent (in) :: phi
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: gout
 
-    complex, dimension (:,:,:,:,:), allocatable :: g0
-
+    complex, dimension (:,:,:,:,:), allocatable :: g0, g0y
+    
     if (proc0) call time_message(.false.,time_gke(:,6),' wstar advance')
 
     allocate (g0(naky,nakx,-nzgrid:nzgrid,ntubes,vmu_lo%llim_proc:vmu_lo%ulim_alloc))
     ! omega_* stays in ky,kx,z space with ky,kx,z local
-    ! get d<chi>/dy
     if (debug) write (*,*) 'time_advance::solve_gke::get_dchidy'
     if (full_flux_surface) then
-       ! FLAG -- ADD SOMETHING HERE
-       call mp_abort ('wstar term not yet setup for full_flux_surface = .true. aborting.')
+       ! get d<chi>/dy in k-space
+       call get_dchidy (phi, apar, bpar, g0)
+
+       allocate (g0y(ny,nakx,-nzgrid:nzgrid,ntubes,vmu_lo%llim_proc:vmu_lo%ulim_alloc))
+       ! transform d<chi>/dy from ky-space to y-space
+       call transform_ky2y (g0, g0y)
+       ! multiply with omega_* coefficient and add to source (RHS of GK eqn)
+       call add_wstar_term_annulus (g0y, gout)
+       deallocate (g0y)
     else
        call get_dchidy (phi, apar, bpar, g0)
        ! multiply with omega_* coefficient and add to source (RHS of GK eqn)
@@ -1380,7 +1415,7 @@ contains
        ! transform dg/dy from k-space to y-space
        call transform_ky2y (g0k, g0y)
        ! add vM . grad y dg/dy term to equation
-       call add_dg_term_global (g0y, wdrifty_g, gout)
+       call add_dg_term_annulus (g0y, wdrifty_g, gout)
        ! get <dphi/dy> in k-space
        do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
           call gyro_average (dphidy, ivmu, g0k(:,:,:,:,ivmu))
@@ -1388,7 +1423,7 @@ contains
        ! transform d<phi>/dy from k-space to y-space
        call transform_ky2y (g0k, g0y)
        ! add vM . grad y d<phi>/dy term to equation
-       call add_dphi_term_global (g0y, wdrifty_phi, gout)
+       call add_dphi_term_annulus (g0y, wdrifty_phi, gout)
        deallocate (g0y, dphidy)
     else
        if (debug) write (*,*) 'time_advance::solve_gke::add_dgdy_term'
@@ -1455,7 +1490,7 @@ contains
        ! transform dg/dx from k-space to y-space
        call transform_ky2y (g0k, g0y)
        ! add vM . grad x dg/dx term to equation
-       call add_dg_term_global (g0y, wdriftx_g, gout)
+       call add_dg_term_annulus (g0y, wdriftx_g, gout)
        ! get <dphi/dx> in k-space
        do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
           call gyro_average (dphidx, ivmu, g0k(:,:,:,:,ivmu))
@@ -1463,7 +1498,7 @@ contains
        ! transform d<phi>/dx from k-space to y-space
        call transform_ky2y (g0k, g0y)
        ! add vM . grad x d<phi>/dx term to equation
-       call add_dphi_term_global (g0y, wdriftx_phi, gout)
+       call add_dphi_term_annulus (g0y, wdriftx_phi, gout)
        deallocate (g0y, dphidx)
     else
        if (debug) write (*,*) 'time_advance::solve_gke::add_dgdx_term'
@@ -2172,7 +2207,15 @@ contains
     complex, dimension (:,:,-nzgrid:,:), intent (in) :: g
     complex, dimension (:,:,-nzgrid:,:), intent (out) :: dgdy
 
-    dgdy = zi*spread(spread(spread(aky,2,nakx),3,2*nzgrid+1),4,ntubes)*g
+    integer :: it, iz, ikx
+
+    do it = 1, ntubes
+      do iz = -nzgrid, nzgrid
+        do ikx = 1, nakx
+          dgdy(:,ikx,iz,it) = zi*aky(:)*g(:,ikx,iz,it)
+        enddo
+      enddo
+    enddo
 
   end subroutine get_dgdy_3d
 
@@ -2188,11 +2231,17 @@ contains
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in) :: g
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (out) :: dgdy
 
-    integer :: ivmu
+    integer :: ivmu, ikx, iz, it
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       dgdy(:,:,:,:,ivmu) = zi*spread(spread(spread(aky,2,nakx),3,2*nzgrid+1),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            dgdy(:,ikx,iz,it,ivmu) = zi*aky(:)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
 
   end subroutine get_dgdy_4d
 
@@ -2208,16 +2257,21 @@ contains
     real, dimension (-nzgrid:,vmu_lo%llim_proc:), intent (in) :: wdrift_in
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: ivmu
+    integer :: ivmu, ikx, iz, it
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) &
-            + spread(spread(spread(wdrift_in(:,ivmu),1,naky),2,nakx),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + wdrift_in(iz,ivmu)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
 
   end subroutine add_dg_term
 
-  subroutine add_dg_term_global (g, wdrift_in, src)
+  subroutine add_dg_term_annulus (g, wdrift_in, src)
 
     use stella_layouts, only: vmu_lo
     use zgrid, only: nzgrid, ntubes
@@ -2229,13 +2283,19 @@ contains
     real, dimension (:,-nzgrid:,vmu_lo%llim_proc:), intent (in) :: wdrift_in
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: ivmu
+    integer :: ivmu, ikx, iz, it
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) - spread(spread(wdrift_in(:,:,ivmu),2,nakx),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+             src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) - wdrift_in(:,iz,ivmu)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
 
-  end subroutine add_dg_term_global
+  end subroutine add_dg_term_annulus
 
   subroutine get_dgdx_2d (g, dgdx)
 
@@ -2255,14 +2315,22 @@ contains
 
     use constants, only: zi
     use zgrid, only: nzgrid, ntubes
-    use kt_grids, only: naky, akx
+    use kt_grids, only: naky, akx, nakx
 
     implicit none
 
     complex, dimension (:,:,-nzgrid:,:), intent (in) :: g
     complex, dimension (:,:,-nzgrid:,:), intent (out) :: dgdx
 
-    dgdx = zi*spread(spread(spread(akx,1,naky),3,2*nzgrid+1),4,ntubes)*g
+    integer :: ikx, iz, it
+
+    do it = 1, ntubes
+      do iz = -nzgrid, nzgrid
+        do ikx = 1, nakx
+          dgdx(:,ikx,iz,it) = zi*akx(ikx)*g(:,ikx,iz,it)
+        enddo
+      enddo
+    enddo
 
   end subroutine get_dgdx_3d
 
@@ -2271,18 +2339,24 @@ contains
     use constants, only: zi
     use stella_layouts, only: vmu_lo
     use zgrid, only: nzgrid, ntubes
-    use kt_grids, only: naky, akx
+    use kt_grids, only: naky, akx, nakx
 
     implicit none
 
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in) :: g
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (out) :: dgdx
 
-    integer :: ivmu
+    integer :: ivmu, ikx, iz, it
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       dgdx(:,:,:,:,ivmu) = zi*spread(spread(spread(akx,1,naky),3,2*nzgrid+1),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            dgdx(:,ikx,iz,it,ivmu) = zi*akx(ikx)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
 
   end subroutine get_dgdx_4d
 
@@ -2298,16 +2372,21 @@ contains
     real, dimension (-nzgrid:,vmu_lo%llim_proc:), intent (in) :: wdrift
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: ivmu
+    integer :: ivmu, it, iz, ikx
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) &
-            + spread(spread(spread(wdrift(:,ivmu),1,naky),2,nakx),4,ntubes)*g(:,:,:,:,ivmu)
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + wdrift(iz,ivmu)*g(:,ikx,iz,it,ivmu)
+          end do
+        end do
+      end do
     end do
 
   end subroutine add_dphi_term
 
-  subroutine add_dphi_term_global (g, wdrift, src)
+  subroutine add_dphi_term_annulus (g, wdrift, src)
 
     use stella_layouts, only: vmu_lo
     use zgrid, only: nzgrid, ntubes
@@ -2319,14 +2398,19 @@ contains
     real, dimension (:,-nzgrid:,vmu_lo%llim_proc:), intent (in) :: wdrift
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: ivmu
+    integer :: ivmu, ikx, iz, it
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) &
-            + spread(spread(wdrift(:,:,ivmu),2,nakx),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + wdrift(:,iz,ivmu)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
 
-  end subroutine add_dphi_term_global
+  end subroutine add_dphi_term_annulus
 
   subroutine add_wstar_term (g, src)
 
@@ -2340,14 +2424,45 @@ contains
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in) :: g
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
 
-    integer :: ivmu
+    integer :: ivmu, it, iz, ikx
 
     do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
-       src(:,:,:,:,ivmu) = src(:,:,:,:,ivmu) &
-            + spread(spread(spread(wstar(1,:,ivmu),1,naky),2,nakx),4,ntubes)*g(:,:,:,:,ivmu)
-    end do
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + wstar(1,iz,ivmu)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
 
   end subroutine add_wstar_term
+
+  subroutine add_wstar_term_annulus (g, src)
+
+    use dist_fn_arrays, only: wstar
+    use stella_layouts, only: vmu_lo
+    use zgrid, only: nzgrid, ntubes
+    use kt_grids, only: naky, nakx
+
+    implicit none
+
+    complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in) :: g
+    complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: src
+
+    integer :: ivmu, it, iz, ikx
+
+    do ivmu = vmu_lo%llim_proc, vmu_lo%ulim_proc
+      do it = 1, ntubes
+        do iz = -nzgrid, nzgrid
+          do ikx = 1, nakx
+            src(:,ikx,iz,it,ivmu) = src(:,ikx,iz,it,ivmu) + wstar(:,iz,ivmu)*g(:,ikx,iz,it,ivmu)
+          enddo
+        enddo
+      enddo
+    enddo
+
+  end subroutine add_wstar_term_annulus
 
   subroutine advance_implicit (istep, phi, apar, bpar, g)
 
@@ -2475,9 +2590,11 @@ contains
        ! if ((stream_implicit.or.driftkinetic_implicit) .and. include_parallel_streaming) &
        !      call advance_parallel_streaming_implicit (g, phi, apar, bpar)
 
-       if (implicit_in_z) &
-            call advance_z_implicit (g, phi, apar, bpar)
-
+       if (implicit_in_z) then
+          call advance_z_implicit (g, phi, apar, bpar)
+          if(radial_variation.or.full_flux_surface) fields_updated = .false.
+       end if
+       
        if (mirror_implicit .and. include_mirror) then
           call advance_mirror_implicit (collisions_implicit, g)
           fields_updated = .false.
@@ -2629,7 +2746,7 @@ contains
     use mp, only: job
     use stella_layouts, only: vmu_lo
     use zgrid, only: nzgrid
-    use multibox, only: multibox_communicate
+    use multibox, only: multibox_communicate, use_dirichlet_bc, apply_radial_boundary_conditions
     use fields, only: fields_updated,advance_fields
     use fields_arrays, only: phi, apar, bpar
     use file_utils, only: runtype_option_switch, runtype_multibox
@@ -2638,15 +2755,19 @@ contains
 
     complex, dimension (:,:,-nzgrid:,:,vmu_lo%llim_proc:), intent (in out) :: g_in
 
-    if(runtype_option_switch.ne.runtype_multibox) return
+    if (runtype_option_switch.eq.runtype_multibox) then
+      if(job.ne.1) then
+        call advance_fields(g_in,phi,apar,bpar,dist='gbar')
+      endif
 
-    if(job.ne.1) then
-      call advance_fields(g_in,phi,apar, bpar,dist='gbar')
-    endif
+      call multibox_communicate(g_in)
 
-    call multibox_communicate(g_in)
-
-    if(job.eq.1) then
+      if(job.eq.1) then
+        fields_updated = .false.
+        call advance_fields(g_in,phi,apar, bpar, dist='gbar')
+      endif
+    else if (use_dirichlet_BC) then
+      call apply_radial_boundary_conditions (g_in)
       fields_updated = .false.
       call advance_fields(g_in,phi,apar, bpar,dist='gbar')
     endif
